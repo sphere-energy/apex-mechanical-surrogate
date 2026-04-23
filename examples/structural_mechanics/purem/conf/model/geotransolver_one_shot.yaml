@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+_target_: rollout.GeoTransolverOneShot
+_convert_: all
+
+# Purem one-shot: predict all 20 future frame positions from frame 0
+# functional_dim = 3 (coords) + 1 (thickness) = 4
+# out_dim = (num_time_steps - 1) * 3 = 20 * 3 = 60
+functional_dim: 4
+out_dim: 60
+geometry_dim: 3
+global_dim: null    # set to number of global features when multi-variant training is enabled
+slice_num: 128
+n_layers: 6
+use_te: false
+time_input: false
+include_local_features: true
+
+num_time_steps: ${training.num_time_steps}

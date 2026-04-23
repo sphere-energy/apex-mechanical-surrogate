@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Purem Abaqus crash surrogate using GeoTransolver (one-shot prediction).
+# Usage: python train.py --config-name=purem_geotransolver_oneshot \
+#            training.raw_data_dir=/path/to/zarr \
+#            training.raw_data_dir_validation=/path/to/zarr_val \
+#            training.num_training_samples=N
+
+hydra:
+  job:
+    chdir: True
+  run:
+    dir: ./outputs/
+
+experiment_name: "Purem-GeoTransolver-OneShot"
+
+defaults:
+  - reader: purem_zarr
+  - datapipe: point_cloud
+  - model: geotransolver_one_shot
+  - training: default
+  - _self_
+
+# ── Data ────────────────────────────────────────────────────────────────────
+
+training:
+  raw_data_dir: ???
+  raw_data_dir_validation: ???
+  global_features_filepath: null    # point to global_features.json when using multi-variant
+  optimizer: adam
+
+  num_time_steps: 21                 # 21 Abaqus field-output frames at 0.025 s intervals
+  num_training_samples: ???
+  num_validation_samples: 0
+
+# ── Datapipe overrides ───────────────────────────────────────────────────────
+
+datapipe:
+  static_features:
+    - thickness                      # per-node shell thickness from mesh .inp
+  dynamic_targets: []                # position-only targets; add [von_mises] when desired
+  global_features: null              # set to [width_mm, height_mm, ...] for parametric model
+  sample_type: all_time_steps
+  dt: 0.025
+
+# ── Model overrides ──────────────────────────────────────────────────────────
+
+model:
+  functional_dim: 4                  # coords(3) + thickness(1)
+  out_dim: 60                        # (21 - 1) * 3 = 60
+  global_dim: null
+  n_layers: 6
