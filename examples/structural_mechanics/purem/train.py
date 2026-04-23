@@ -116,6 +116,7 @@ class Trainer:
             num_workers=cfg.training.num_dataloader_workers,
             sampler=sampler,
             collate_fn=simsample_collate,
+            multiprocessing_context="fork" if cfg.training.num_dataloader_workers > 0 else None,
         )
         self.sampler = sampler
 
