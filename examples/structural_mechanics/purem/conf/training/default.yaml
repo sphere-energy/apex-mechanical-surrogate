@@ -44,3 +44,4 @@ ckpt_path: "./checkpoints"
 mlflow_tracking_uri: null       # null = auto: <project_root>/mlruns/
 mlflow_run_name: null           # null = experiment_name
 mlflow_run_group: null          # logical grouping tag, e.g. "ablation_v1"
+mlflow_model_registry_name: null  # null = skip registry; set to register model versions

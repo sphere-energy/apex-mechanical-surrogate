@@ -58,9 +58,10 @@ class TrainingConfig:
     ckpt_path: str = "./checkpoints"
 
     # ── MLflow experiment tracking ───────────────────────────────────────────
-    mlflow_tracking_uri: Optional[str] = None   # null = auto: <project_root>/mlruns/
-    mlflow_run_name: Optional[str] = None        # null = experiment_name
-    mlflow_run_group: Optional[str] = None       # logical grouping tag, set via CLI
+    mlflow_tracking_uri: Optional[str] = None        # null = auto: <project_root>/mlruns/
+    mlflow_run_name: Optional[str] = None             # null = experiment_name
+    mlflow_run_group: Optional[str] = None            # logical grouping tag, set via CLI
+    mlflow_model_registry_name: Optional[str] = None  # null = skip registry; set to register versions
 
 
 @dataclass

@@ -45,6 +45,7 @@ from physicsnemo.utils.logging.mlflow import MLFLOW_AVAILABLE
 
 if MLFLOW_AVAILABLE:
     import mlflow
+    import mlflow.pytorch
     from physicsnemo.utils.logging.mlflow import initialize_mlflow
 
 _tabulate = OptionalImport("tabulate")
@@ -428,6 +429,27 @@ def main(cfg: DictConfig) -> None:
                 epoch=epoch + 1,
             )
             logger.info(f"Saved model on rank {dist.rank}")
+
+            if use_mlflow and cfg.training.mlflow_model_registry_name:
+                registry_name = cfg.training.mlflow_model_registry_name
+                inner = (
+                    trainer.model.module
+                    if isinstance(trainer.model, DistributedDataParallel)
+                    else trainer.model
+                )
+                artifact_path = f"model/epoch_{epoch + 1}"
+                mlflow.pytorch.log_model(inner, artifact_path=artifact_path)
+                mv = mlflow.register_model(
+                    f"runs:/{mlflow_run_id}/{artifact_path}", registry_name
+                )
+                mlflow_client.update_model_version(
+                    name=registry_name,
+                    version=mv.version,
+                    description=f"epoch={epoch + 1}  avg_loss={avg_loss:.6f}",
+                )
+                logger0.info(
+                    f"Registered model v{mv.version} → '{registry_name}' (epoch {epoch + 1})"
+                )
 
         if (
             cfg.training.num_validation_samples > 0
