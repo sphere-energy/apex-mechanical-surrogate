@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+defaults:
+  - base_geotransolver_one_shot   # Hydra structured config schema (structured_configs.py)
+
 _target_: rollout.GeoTransolverOneShot
 _convert_: all
 

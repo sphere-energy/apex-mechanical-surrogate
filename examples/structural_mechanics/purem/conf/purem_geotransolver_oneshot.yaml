@@ -12,7 +12,7 @@ hydra:
   job:
     chdir: True
   run:
-    dir: ./outputs/
+    dir: ./outputs/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
 
 experiment_name: "Purem-GeoTransolver-OneShot"
 
@@ -34,6 +34,11 @@ training:
   num_time_steps: 21                 # 21 Abaqus field-output frames at 0.025 s intervals
   num_training_samples: ???
   num_validation_samples: 0
+
+  # ── MLflow ──────────────────────────────────────────────────────────────
+  mlflow_tracking_uri: null          # null = <project_root>/mlruns/
+  mlflow_run_name: null              # null = experiment_name
+  mlflow_run_group: null             # e.g. "ablation_thickness" — groups related runs in UI
 
 # ── Datapipe overrides ───────────────────────────────────────────────────────
 

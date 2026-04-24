@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+defaults:
+  - base_point_cloud   # Hydra structured config schema (structured_configs.py)
+
 _target_: datapipe.CrashPointCloudDataset
 _convert_: all
 data_dir: ${training.raw_data_dir}

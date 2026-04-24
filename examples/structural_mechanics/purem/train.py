@@ -24,21 +24,28 @@ sys.path.insert(0, os.path.dirname(__file__))
 # Add crash/ to path for utils (build_muon_optimizer, load_global_features)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "crash"))
 
+import structured_configs  # noqa: F401  registers Hydra structured config schemas
+
 import hydra
 import omegaconf
-from hydra.utils import instantiate
+from hydra.core.hydra_config import HydraConfig
+from hydra.utils import get_original_cwd, instantiate
 from omegaconf import DictConfig
 
 import torch
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
 
 from physicsnemo.core.version_check import OptionalImport
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils import load_checkpoint, save_checkpoint
+from physicsnemo.utils.logging.mlflow import MLFLOW_AVAILABLE
+
+if MLFLOW_AVAILABLE:
+    import mlflow
+    from physicsnemo.utils.logging.mlflow import initialize_mlflow
 
 _tabulate = OptionalImport("tabulate")
 _torchinfo = OptionalImport("torchinfo")
@@ -222,9 +229,6 @@ class Trainer:
             device=self.dist.device,
         )
 
-        if self.dist.rank == 0:
-            self.writer = SummaryWriter(log_dir=cfg.training.tensorboard_log_dir)
-
     def train(self, sample: SimSample):
         self.optimizer.zero_grad()
         loss = self.forward(sample)
@@ -271,6 +275,75 @@ class Trainer:
         }
 
 
+def _setup_mlflow(cfg: DictConfig, dist: DistributedManager, logger0: RankZeroLoggingWrapper):
+    """Initialise MLflow on rank 0. Returns (client, run_id) or (None, None)."""
+    if dist.rank != 0 or not MLFLOW_AVAILABLE:
+        return None, None
+
+    import getpass
+
+    tracking_uri = cfg.training.mlflow_tracking_uri or os.path.join(
+        get_original_cwd(), "mlruns"
+    )
+    run_name = cfg.training.mlflow_run_name or cfg.experiment_name
+    mlflow_client, mlflow_run = initialize_mlflow(
+        experiment_name=cfg.experiment_name,
+        run_name=run_name,
+        mode="offline",
+        tracking_location=tracking_uri,
+        user_name=getpass.getuser(),
+    )
+    run_id = mlflow_run.info.run_id
+    mlflow.start_run(run_id=run_id)
+
+    # ── Hyperparameters ──────────────────────────────────────────────────────
+    mlflow.log_params({
+        "epochs": cfg.training.epochs,
+        "start_lr": cfg.training.start_lr,
+        "end_lr": cfg.training.end_lr,
+        "optimizer": cfg.training.optimizer,
+        "num_training_samples": cfg.training.num_training_samples,
+        "num_time_steps": cfg.training.num_time_steps,
+        "amp": cfg.training.amp,
+        "num_dataloader_workers": cfg.training.num_dataloader_workers,
+        "n_layers": cfg.model.n_layers,
+        "out_dim": cfg.model.out_dim,
+        "functional_dim": cfg.model.functional_dim,
+        "geometry_dim": cfg.model.geometry_dim,
+        "slice_num": cfg.model.slice_num,
+        "global_dim": cfg.model.global_dim,
+        "static_features": ",".join(cfg.datapipe.static_features) or "(none)",
+        "dynamic_targets": ",".join(cfg.datapipe.dynamic_targets) or "(none)",
+        "sample_type": cfg.datapipe.sample_type,
+        "dt": cfg.datapipe.dt,
+    })
+
+    # ── Tags (filtering / traceability) ─────────────────────────────────────
+    output_dir = HydraConfig.get().runtime.output_dir
+    mlflow.set_tag("data_dir", cfg.training.raw_data_dir)
+    mlflow.set_tag("output_dir", output_dir)   # MLflow UI → filesystem link
+    if cfg.training.mlflow_run_group:
+        mlflow.set_tag("run_group", cfg.training.mlflow_run_group)
+
+    try:
+        import subprocess
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        mlflow.set_tag("git_commit", commit)
+    except Exception:
+        pass
+
+    # ── Filesystem → MLflow link ─────────────────────────────────────────────
+    with open(os.path.join(output_dir, "mlflow_run_id.txt"), "w") as f:
+        f.write(run_id)
+
+    logger0.info(f"MLflow run ID: {run_id}  experiment: {cfg.experiment_name}")
+    logger0.info(f"MLflow tracking URI: {tracking_uri}")
+
+    return mlflow_client, run_id
+
+
 @hydra.main(version_base="1.3", config_path="conf", config_name="purem_geotransolver_oneshot")
 def main(cfg: DictConfig) -> None:
     DistributedManager.initialize()
@@ -280,11 +353,15 @@ def main(cfg: DictConfig) -> None:
     logger0 = RankZeroLoggingWrapper(logger, dist)
     logger0.file_logging()
 
+    output_dir = HydraConfig.get().runtime.output_dir
+    logger0.info(f"Run output directory: {output_dir}")
     logger0.info(f"Config:\n{omegaconf.OmegaConf.to_yaml(cfg, resolve=True)}")
-    logger0.info(f"Output directory: {cfg.training.tensorboard_log_dir}")
     logger0.info(f"Checkpoint directory: {cfg.training.ckpt_path}")
     stats_dir = getattr(cfg.datapipe, "stats_dir")
     logger0.info(f"Stats directory: {stats_dir}")
+
+    mlflow_client, mlflow_run_id = _setup_mlflow(cfg, dist, logger0)
+    use_mlflow = mlflow_run_id is not None
 
     trainer = Trainer(cfg, logger0)
     logger0.info("Training started...")
@@ -323,18 +400,19 @@ def main(cfg: DictConfig) -> None:
         trainer.scheduler.step()
 
         avg_loss = total_loss / max(num_batches, 1)
+        current_lr = trainer.optimizer.param_groups[0]["lr"]
         epoch_duration = time.time() - start
         logger0.info(
             f"Epoch {epoch + 1}/{cfg.training.epochs} "
             f"avg_loss: {avg_loss:.6f} "
-            f"lr: {trainer.optimizer.param_groups[0]['lr']:.3e} "
+            f"lr: {current_lr:.3e} "
             f"duration: {epoch_duration:.2f}s"
         )
 
-        if dist.rank == 0:
-            trainer.writer.add_scalar("loss", avg_loss, epoch)
-            trainer.writer.add_scalar(
-                "learning_rate", trainer.optimizer.param_groups[0]["lr"], epoch
+        if dist.rank == 0 and use_mlflow:
+            mlflow.log_metrics(
+                {"train/avg_loss": avg_loss, "train/lr": current_lr},
+                step=epoch,
             )
 
         if dist.world_size > 1:
@@ -366,16 +444,15 @@ def main(cfg: DictConfig) -> None:
                 logger0.info(
                     f"\nValidation metrics:\n{_tabulate.tabulate(rows, headers=['Metric', 'Value'], tablefmt='pretty')}\n"
                 )
-            if dist.rank == 0:
-                trainer.writer.add_scalar("val/MSE", val_stats["MSE"].item(), epoch)
-                for i in range(len(val_stats["MSE_w_time"])):
-                    trainer.writer.add_scalar(
-                        f"val/timestep_{i}_MSE", val_stats["MSE_w_time"][i].item(), epoch
-                    )
+            if dist.rank == 0 and use_mlflow:
+                val_metrics = {"val/MSE": mse_val}
+                for i, m in enumerate(mse_w_time):
+                    val_metrics[f"val/timestep_{i}_MSE"] = m.item()
+                mlflow.log_metrics(val_metrics, step=epoch)
 
     logger0.info("Training completed!")
-    if dist.rank == 0:
-        trainer.writer.close()
+    if dist.rank == 0 and use_mlflow:
+        mlflow.end_run()
 
 
 if __name__ == "__main__":

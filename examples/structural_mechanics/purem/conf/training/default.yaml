@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+defaults:
+  - base_training   # Hydra structured config schema (structured_configs.py)
+
 raw_data_dir: ???               # Required: set via experiment config
 raw_data_dir_validation: ???    # Required: set via experiment config
 global_features_filepath: null  # Optional: path to global_features.json
@@ -36,4 +39,8 @@ use_apex: True
 num_dataloader_workers: 4      # Reduced from 8; Zarr IO is fast
 
 ckpt_path: "./checkpoints"
-tensorboard_log_dir: ./tensorboard_logs
+
+# MLflow experiment tracking
+mlflow_tracking_uri: null       # null = auto: <project_root>/mlruns/
+mlflow_run_name: null           # null = experiment_name
+mlflow_run_group: null          # logical grouping tag, e.g. "ablation_v1"
