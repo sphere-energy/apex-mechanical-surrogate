@@ -31,7 +31,7 @@ num_validation_samples: 0
 start_lr: 0.0001
 end_lr: 0.0000003
 epochs: 10000
-validation_freq: 10
+validation_freq: 1
 save_checkpoint_freq: 10
 
 amp: True
@@ -39,9 +39,10 @@ use_apex: True
 num_dataloader_workers: 4      # Reduced from 8; Zarr IO is fast
 
 ckpt_path: "./checkpoints"
+top_k_checkpoints: 10            # keep top-K checkpoints by val loss; 0 = save every save_checkpoint_freq epochs
 
 # MLflow experiment tracking
 mlflow_tracking_uri: null       # null = auto: <project_root>/mlruns/
 mlflow_run_name: null           # null = experiment_name
 mlflow_run_group: null          # logical grouping tag, e.g. "ablation_v1"
-mlflow_model_registry_name: null  # null = skip registry; set to register model versions
+mlflow_model_registry_name: null  # null = auto: experiment_name

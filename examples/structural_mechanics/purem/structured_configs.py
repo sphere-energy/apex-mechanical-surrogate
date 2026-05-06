@@ -57,11 +57,14 @@ class TrainingConfig:
     max_workers_preprocessing: int = 64
     ckpt_path: str = "./checkpoints"
 
+    # ── Checkpointing ────────────────────────────────────────────────────────
+    top_k_checkpoints: int = 3                        # keep top-K by val loss; 0 = save every save_checkpoint_freq epochs
+
     # ── MLflow experiment tracking ───────────────────────────────────────────
     mlflow_tracking_uri: Optional[str] = None        # null = auto: <project_root>/mlruns/
     mlflow_run_name: Optional[str] = None             # null = experiment_name
     mlflow_run_group: Optional[str] = None            # logical grouping tag, set via CLI
-    mlflow_model_registry_name: Optional[str] = None  # null = skip registry; set to register versions
+    mlflow_model_registry_name: Optional[str] = None  # null = auto: experiment_name
 
 
 @dataclass

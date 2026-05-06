@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
+import heapq
 import os
 import sys
 import time
@@ -276,6 +278,60 @@ class Trainer:
         }
 
 
+class _TopKCheckpoints:
+    """Prune saved checkpoints to keep only the K best by the provided metric.
+
+    Checkpoints are saved unconditionally at save_checkpoint_freq; this class
+    decides which to keep.
+    """
+
+    def __init__(self, k: int, ckpt_path: str):
+        self.k = k
+        self.ckpt_path = ckpt_path
+        # max-heap via negation so heap[0] is the *worst* kept checkpoint
+        self._heap: list = []  # [(-val_loss, epoch), ...]
+        self._saved_epochs: list[int] = []  # all checkpoint epochs on disk (not yet evaluated)
+
+    def register_saved(self, epoch: int) -> None:
+        """Call after every save_checkpoint to track what's on disk."""
+        self._saved_epochs.append(epoch)
+
+    def update(self, val_loss: float, epoch: int) -> tuple[bool, list[int]]:
+        """Call at each validation step. Returns (kept, epochs_to_evict).
+
+        kept=True means this epoch's checkpoint was admitted into the top-K.
+        """
+        if epoch not in self._saved_epochs:
+            return False, []
+        self._saved_epochs.remove(epoch)
+
+        evict = []
+        if len(self._heap) < self.k:
+            heapq.heappush(self._heap, (-val_loss, epoch))
+            return True, evict
+        elif val_loss < -self._heap[0][0]:  # better than current worst
+            _, worst_epoch = heapq.heapreplace(self._heap, (-val_loss, epoch))
+            evict.append(worst_epoch)
+            return True, evict
+        else:
+            evict.append(epoch)
+            return False, evict
+
+    def flush_unvalidated(self) -> list[int]:
+        """Return epochs that were saved but never validated (training ended early)."""
+        epochs = list(self._saved_epochs)
+        self._saved_epochs.clear()
+        return epochs
+
+    def delete_epoch(self, epoch: int) -> None:
+        for pattern in (f"*.{epoch}.mdlus", f"*.{epoch}.pt"):
+            for f in glob.glob(os.path.join(self.ckpt_path, pattern)):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+
 def _setup_mlflow(cfg: DictConfig, dist: DistributedManager, logger0: RankZeroLoggingWrapper):
     """Initialise MLflow on rank 0. Returns (client, run_id) or (None, None)."""
     if dist.rank != 0 or not MLFLOW_AVAILABLE:
@@ -339,10 +395,12 @@ def _setup_mlflow(cfg: DictConfig, dist: DistributedManager, logger0: RankZeroLo
     with open(os.path.join(output_dir, "mlflow_run_id.txt"), "w") as f:
         f.write(run_id)
 
+    registry_name = cfg.training.mlflow_model_registry_name or cfg.experiment_name
     logger0.info(f"MLflow run ID: {run_id}  experiment: {cfg.experiment_name}")
     logger0.info(f"MLflow tracking URI: {tracking_uri}")
+    logger0.info(f"MLflow model registry name: {registry_name}")
 
-    return mlflow_client, run_id
+    return mlflow_client, run_id, registry_name
 
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="purem_geotransolver_oneshot")
@@ -361,8 +419,17 @@ def main(cfg: DictConfig) -> None:
     stats_dir = getattr(cfg.datapipe, "stats_dir")
     logger0.info(f"Stats directory: {stats_dir}")
 
-    mlflow_client, mlflow_run_id = _setup_mlflow(cfg, dist, logger0)
+    mlflow_client, mlflow_run_id, mlflow_registry_name = _setup_mlflow(cfg, dist, logger0)
     use_mlflow = mlflow_run_id is not None
+
+    top_k = cfg.training.top_k_checkpoints
+    use_top_k = top_k > 0
+    ckpt_tracker = _TopKCheckpoints(top_k, cfg.training.ckpt_path) if use_top_k else None
+    if use_top_k:
+        metric_str = "validation loss" if cfg.training.num_validation_samples > 0 else "train loss"
+        logger0.info(f"Checkpoint strategy: top-{top_k} by {metric_str}")
+    else:
+        logger0.info(f"Checkpoint strategy: save every {cfg.training.save_checkpoint_freq} epochs")
 
     trainer = Trainer(cfg, logger0)
     logger0.info("Training started...")
@@ -419,6 +486,7 @@ def main(cfg: DictConfig) -> None:
         if dist.world_size > 1:
             torch.distributed.barrier()
 
+        # ── Checkpoint save (always at save_checkpoint_freq) ─────────────────
         if dist.rank == 0 and (epoch + 1) % cfg.training.save_checkpoint_freq == 0:
             save_checkpoint(
                 cfg.training.ckpt_path,
@@ -428,29 +496,12 @@ def main(cfg: DictConfig) -> None:
                 scaler=trainer.scaler,
                 epoch=epoch + 1,
             )
-            logger.info(f"Saved model on rank {dist.rank}")
+            logger0.info(f"Saved checkpoint at epoch {epoch + 1}")
+            if use_top_k:
+                ckpt_tracker.register_saved(epoch + 1)
 
-            if use_mlflow and cfg.training.mlflow_model_registry_name:
-                registry_name = cfg.training.mlflow_model_registry_name
-                inner = (
-                    trainer.model.module
-                    if isinstance(trainer.model, DistributedDataParallel)
-                    else trainer.model
-                )
-                artifact_path = f"model/epoch_{epoch + 1}"
-                mlflow.pytorch.log_model(inner, artifact_path=artifact_path)
-                mv = mlflow.register_model(
-                    f"runs:/{mlflow_run_id}/{artifact_path}", registry_name
-                )
-                mlflow_client.update_model_version(
-                    name=registry_name,
-                    version=mv.version,
-                    description=f"epoch={epoch + 1}  avg_loss={avg_loss:.6f}",
-                )
-                logger0.info(
-                    f"Registered model v{mv.version} → '{registry_name}' (epoch {epoch + 1})"
-                )
-
+        # ── Validation ───────────────────────────────────────────────────────
+        mse_val = None
         if (
             cfg.training.num_validation_samples > 0
             and (epoch + 1) % cfg.training.validation_freq == 0
@@ -471,6 +522,38 @@ def main(cfg: DictConfig) -> None:
                 for i, m in enumerate(mse_w_time):
                     val_metrics[f"val/timestep_{i}_MSE"] = m.item()
                 mlflow.log_metrics(val_metrics, step=epoch)
+
+        # ── Top-K pruning ────────────────────────────────────────────────
+        if use_top_k and dist.rank == 0 and (epoch + 1) in ckpt_tracker._saved_epochs:
+            metric_val = mse_val if mse_val is not None else avg_loss
+            metric_name = "val/MSE" if mse_val is not None else "train/avg_loss"
+
+            kept, evict_epochs = ckpt_tracker.update(metric_val, epoch + 1)
+            for evict_epoch in evict_epochs:
+                ckpt_tracker.delete_epoch(evict_epoch)
+                logger0.info(f"Top-{top_k}: evicted checkpoint at epoch {evict_epoch}")
+            if kept:
+                logger0.info(f"Top-{top_k}: kept checkpoint at epoch {epoch + 1} ({metric_name}={metric_val:.6f})")
+
+                if use_mlflow:
+                    inner = (
+                        trainer.model.module
+                        if isinstance(trainer.model, DistributedDataParallel)
+                        else trainer.model
+                    )
+                    artifact_path = f"model_epoch_{epoch + 1}"
+                    mlflow.pytorch.log_model(inner, artifact_path=artifact_path)
+                    mv = mlflow.register_model(
+                        f"runs:/{mlflow_run_id}/{artifact_path}", mlflow_registry_name
+                    )
+                    mlflow_client.update_model_version(
+                        name=mlflow_registry_name,
+                        version=mv.version,
+                        description=f"epoch={epoch + 1}  {metric_name}={metric_val:.6f}",
+                    )
+                    logger0.info(
+                        f"Registered model v{mv.version} → '{mlflow_registry_name}' (epoch {epoch + 1})"
+                    )
 
     logger0.info("Training completed!")
     if dist.rank == 0 and use_mlflow:
